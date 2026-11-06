@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2023 Tom Bonan
 ;; Author: Tom Bonan <emacs-git-open@tombonan.me>
-;; Version: 0.2.0
+;; Version: 0.4.0
 ;; Keywords: git, github
 ;; URL: https://github.com/tombonan/emacs-git-open
 ;; Package-Requires: ((emacs "28.1") (magit "3.0.0"))
@@ -32,6 +32,10 @@
 ;; Inspired by: https://github.com/paulirish/git-open
 
 ;;; Change Log:
+;;
+;; 2026-11-06 - v0.4.0
+;; * Add support for GitLab remotes, including self-hosted instances
+;; * Generalize remote URL parsing (ssh://, scp-like, ports, nested groups)
 ;;
 ;; 2026-01-21 - v0.3.0
 ;; * Modernize tests
@@ -88,27 +92,89 @@ Signal an error if the remote is not found."
         (error "Remote '%s' not found" emacs-git-open-default-remote)
       remote-url)))
 
+(defun emacs-git-open--split-remote-url (remote-url)
+  "Split REMOTE-URL into a (HOST . PATH) cons.
+Handles scp-like SSH remotes (e.g. \"git@host:path\"), explicit
+protocol remotes (e.g. \"ssh://git@host:port/path\",
+\"https://host/path\"), and strips any embedded username or port."
+  (cond
+   ((string-match
+     "\\`[a-z+]+://\\(?:[^@/]+@\\)?\\([^:/]+\\)\\(?::[0-9]+\\)?/\\(.*\\)\\'"
+     remote-url)
+    (cons (match-string 1 remote-url) (match-string 2 remote-url)))
+   ((string-match "\\`\\(?:[^@]+@\\)?\\([^:/]+\\):\\(.*\\)\\'" remote-url)
+    (cons (match-string 1 remote-url) (match-string 2 remote-url)))
+   (t (error "Unrecognized remote URL: %s" remote-url))))
+
 (defun emacs-git-open--parse-remote (remote-url)
   "Convert REMOTE-URL to a browser-friendly HTTPS URL."
-  (let* ((parsed-url (replace-regexp-in-string "^git@github.com:" "https://github.com/" remote-url))
-         (parsed-url (replace-regexp-in-string "\\.git$" "" parsed-url)))
-    parsed-url))
+  (let* ((host-and-path (emacs-git-open--split-remote-url remote-url))
+         (path (replace-regexp-in-string "\\.git\\'" "" (cdr host-and-path)))
+         (path (replace-regexp-in-string "/\\'" "" path)))
+    (concat "https://" (car host-and-path) "/" path)))
 
-(defun emacs-git-open--remote-file-url (&optional view-mode tree-path)
+(defun emacs-git-open--remote-host (parsed-remote-url)
+  "Return the host portion of PARSED-REMOTE-URL, an https:// URL."
+  (and (string-match "\\`https://\\([^/]+\\)" parsed-remote-url)
+       (match-string 1 parsed-remote-url)))
+
+(defconst emacs-git-open--provider-config
+  '((github . ((blob . "blob") (blame . "blame") (commit . "commit")
+               (line-format . "#L%d-L%d")))
+    (gitlab . ((blob . "-/blob") (blame . "-/blame") (commit . "-/commit")
+               (line-format . "#L%d-%d"))))
+  "Mapping providers to remote URL conventions.")
+
+(defun emacs-git-open--provider-config-get (provider key)
+  "Return a config value for a provider and key"
+  (alist-get key (alist-get provider emacs-git-open--provider-config)))
+
+(defun emacs-git-open--detect-provider (host)
+  "Guess the git hosting provider from HOST, defaulting to `github'."
+  (if (string-match-p "gitlab" host)
+      'gitlab
+    'github))
+
+(defun emacs-git-open--provider (host)
+  "Return the git hosting provider for HOST.
+Checks the `emacs-git-open.provider' git config, scoped to HOST via
+`--get-urlmatch', e.g.:
+
+  git config --global \"emacs-git-open.https://git.example.com.provider\" gitlab
+
+Falls back to `emacs-git-open--detect-provider' when unset."
+  (let ((configured (magit-git-string
+                      "config" "--get-urlmatch" "emacs-git-open.provider"
+                      (concat "https://" host))))
+    (if configured
+        (intern configured)
+      (emacs-git-open--detect-provider host))))
+
+(defun emacs-git-open--encode-ref (ref)
+  "Percent-encode characters in REF that are unsafe in a URL path segment."
+  (let* ((ref (replace-regexp-in-string "%" "%25" ref))
+         (ref (replace-regexp-in-string "#" "%23" ref)))
+    ref))
+
+(defun emacs-git-open--remote-file-url (&optional view tree-path)
   "Return the URL of the current file on the remote.
-VIEW-MODE specifies the GitHub view type (e.g., \"blob\" or \"blame\").
-Defaults to \"blob\" if not specified.
+VIEW specifies the view type, either `blame' or `blob' (the default).
 TREE-PATH is a branch name or commit SHA.  Defaults to the most recent
 commit SHA of the file if not specified.
 If a region is active, line numbers are appended to the URL."
-  (let* ((view-mode (or view-mode "blob"))
-         (tree-path (or tree-path (emacs-git-open--get-latest-sha)))
+  (let* ((view (or view 'blob))
+         (tree-path (emacs-git-open--encode-ref
+                     (or tree-path (emacs-git-open--get-latest-sha))))
          (remote-url (emacs-git-open--parse-remote (emacs-git-open--remote-url)))
-         (remote-url (concat remote-url "/" view-mode "/" tree-path "/" (emacs-git-open--relative-file-path))))
+         (provider (emacs-git-open--provider (emacs-git-open--remote-host remote-url)))
+         (remote-url (concat remote-url "/" (emacs-git-open--provider-config-get provider view)
+                              "/" tree-path "/" (emacs-git-open--relative-file-path))))
     (if (region-active-p)
         (let ((start-line (line-number-at-pos (region-beginning)))
               (end-line (line-number-at-pos (region-end))))
-          (format "%s#L%d-L%d" remote-url start-line end-line))
+          (concat remote-url
+                  (format (emacs-git-open--provider-config-get provider 'line-format)
+                          start-line end-line)))
       remote-url)))
 
 (defun emacs-git-open--get-latest-sha ()
@@ -121,8 +187,10 @@ If a region is active, line numbers are appended to the URL."
 
 (defun emacs-git-open--commit-url ()
   "Return the URL of the commit at the current line in a magit-blame buffer."
-  (let ((remote-url (emacs-git-open--parse-remote (emacs-git-open--remote-url))))
-    (concat remote-url "/commit/" (emacs-git-open--get-commit-sha))))
+  (let* ((remote-url (emacs-git-open--parse-remote (emacs-git-open--remote-url)))
+         (provider (emacs-git-open--provider (emacs-git-open--remote-host remote-url))))
+    (concat remote-url "/" (emacs-git-open--provider-config-get provider 'commit)
+            "/" (emacs-git-open--get-commit-sha))))
 
 (defun emacs-git-open--copy-url (url)
   "Copy URL to the kill ring and display a message."
@@ -133,49 +201,49 @@ If a region is active, line numbers are appended to the URL."
 (defun git-open ()
   "Open the current buffer's file on the remote in a browser."
   (interactive)
-  (browse-url (emacs-git-open--remote-file-url "blob")))
+  (browse-url (emacs-git-open--remote-file-url 'blob)))
 
 ;;;###autoload
 (defun git-open-copy ()
   "Copy the URL of the current buffer's file on the remote to the kill ring."
   (interactive)
-  (emacs-git-open--copy-url (emacs-git-open--remote-file-url "blob")))
+  (emacs-git-open--copy-url (emacs-git-open--remote-file-url 'blob)))
 
 ;;;###autoload
 (defun git-open-default-branch ()
   "Open the current buffer's file on the remote default branch in a browser."
   (interactive)
-  (browse-url (emacs-git-open--remote-file-url "blob" (emacs-git-open--default-branch))))
+  (browse-url (emacs-git-open--remote-file-url 'blob (emacs-git-open--default-branch))))
 
 ;;;###autoload
 (defun git-open-default-branch-copy ()
   "Copy the URL of the current file on the remote default branch to the kill ring."
   (interactive)
-  (emacs-git-open--copy-url (emacs-git-open--remote-file-url "blob" (emacs-git-open--default-branch))))
+  (emacs-git-open--copy-url (emacs-git-open--remote-file-url 'blob (emacs-git-open--default-branch))))
 
 ;;;###autoload
 (defun git-open-current-branch ()
   "Open the current buffer's file on the remote current branch in a browser."
   (interactive)
-  (browse-url (emacs-git-open--remote-file-url "blob" (emacs-git-open--current-branch))))
+  (browse-url (emacs-git-open--remote-file-url 'blob (emacs-git-open--current-branch))))
 
 ;;;###autoload
 (defun git-open-current-branch-copy ()
   "Copy the URL of the current file on the remote current branch to the kill ring."
   (interactive)
-  (emacs-git-open--copy-url (emacs-git-open--remote-file-url "blob" (emacs-git-open--current-branch))))
+  (emacs-git-open--copy-url (emacs-git-open--remote-file-url 'blob (emacs-git-open--current-branch))))
 
 ;;;###autoload
 (defun git-open-blame ()
   "Open the blame view of the current buffer's file on the remote in a browser."
   (interactive)
-  (browse-url (emacs-git-open--remote-file-url "blame" (emacs-git-open--default-branch))))
+  (browse-url (emacs-git-open--remote-file-url 'blame (emacs-git-open--default-branch))))
 
 ;;;###autoload
 (defun git-open-blame-copy ()
   "Copy the blame view URL of the current buffer's file to the kill ring."
   (interactive)
-  (emacs-git-open--copy-url (emacs-git-open--remote-file-url "blame" (emacs-git-open--default-branch))))
+  (emacs-git-open--copy-url (emacs-git-open--remote-file-url 'blame (emacs-git-open--default-branch))))
 
 ;;;###autoload
 (defun git-open-commit ()

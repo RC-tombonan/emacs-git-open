@@ -42,6 +42,21 @@ M-x git-open-commit
 
 <img src="./git-open-commit-usage.gif" alt="Git Open Commit Usage" width="500" height="600">
 
+### GitLab and Self-Hosted Remotes
+
+`emacs-git-open` auto-detects GitLab remotes whenever the remote's hostname contains `gitlab`.
+
+If the self-hosted instance's hostname doesn't contain "gitlab", the
+provider can be set explicitly. This is a normal git config value, scoped to the remote's host via
+[`--get-urlmatch`](https://git-scm.com/docs/git-config#Documentation/git-config.txt---get-urlmatchnameURL),
+so one setting covers every repo cloned from that host:
+
+```bash
+git config --global "emacs-git-open.https://git.example.com.provider" gitlab
+```
+
+It can also be set per-repo in `.git/config` to override the global value for that repository.
+
 ### Default Branches
 
 My typical workflow often involves wanting to open up remote files from the default remote branch, either
@@ -57,6 +72,5 @@ basis by editing `.git/config`:
 
 ### Todo
 - Support remote targets other than 'origin'
-- Support other git hosting services (gitlab, bitbucket etc.)
-- Tests
+- Support additional git hosting services (e.g. Bitbucket)
 - Packaging for MELPA
